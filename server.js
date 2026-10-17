@@ -14,6 +14,7 @@ import { simpleParser } from 'mailparser';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
@@ -35,9 +36,40 @@ class YahooMailMCPServer {
         // Store active SSE transports (for routing messages)
         this.transports = new Map();
 
-        // Store valid OAuth access tokens (in-memory)
-        // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
+        // OAuth access tokens are stateless: signed with OAUTH_CLIENT_SECRET,
+        // so they survive process restarts (Render free-tier spin-down).
+        this.issueToken = (clientId, scope = 'mcp', ttlSeconds = 86400) => {
+            const payload = Buffer.from(JSON.stringify({
+                cid: clientId,
+                scope,
+                exp: Math.floor(Date.now() / 1000) + ttlSeconds
+            })).toString('base64url');
+            const sig = crypto
+                .createHmac('sha256', process.env.OAUTH_CLIENT_SECRET)
+                .update(payload)
+                .digest('base64url');
+            return `${payload}.${sig}`;
+        };
+
+        this.verifyToken = (token) => {
+            if (typeof token !== 'string') return false;
+            const parts = token.split('.');
+            if (parts.length !== 2) return false;
+            const [payload, sig] = parts;
+            const expected = crypto
+                .createHmac('sha256', process.env.OAUTH_CLIENT_SECRET)
+                .update(payload)
+                .digest('base64url');
+            const a = Buffer.from(sig);
+            const b = Buffer.from(expected);
+            if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+            try {
+                const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+                return data.exp > Math.floor(Date.now() / 1000);
+            } catch {
+                return false;
+            }
+        };
 
         // Store authorization codes for OAuth authorization code flow
         // In production, use Redis with short TTL (60 seconds)
@@ -1331,7 +1363,7 @@ class YahooMailMCPServer {
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
             // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            if (!this.verifyToken(token)) {
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1529,15 +1561,14 @@ class YahooMailMCPServer {
                 this.authCodes.delete(code);
 
                 // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = this.issueToken(reqClientId, authData.scope || 'mcp');
 
                 console.error('[OAuth] Access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: 86400,
                     scope: authData.scope || 'mcp'
                 });
             }
@@ -1545,15 +1576,14 @@ class YahooMailMCPServer {
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
                 // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = this.issueToken(clientId, 'mcp');
 
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: 86400,
                     scope: 'mcp'
                 });
             }
