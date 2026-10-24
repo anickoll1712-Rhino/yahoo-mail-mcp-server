@@ -1,6 +1,6 @@
 {
   "name": "yahoo-mail-mcp",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Yahoo Mail MCP Server - Full email management via IMAP",
   "type": "module",
   "main": "server.js",
@@ -15,7 +15,9 @@
     "docker:compose:down": "docker-compose down",
     "docker:compose:logs": "docker-compose logs -f",
     "test:health": "node -e \"require('http').get('http://localhost:3000/health', r => { let d=''; r.on('data', c => d+=c); r.on('end', () => console.log(d)); })\"",
-    "test:sse": "node -e \"require('http').get('http://localhost:3000/mcp/sse', r => console.log('SSE Status:', r.statusCode))\""
+    "test:sse": "node -e \"require('http').get('http://localhost:3000/mcp/sse', r => console.log('SSE Status:', r.statusCode))\"",
+    "test:mcp": "node -e \"const http=require('http');const body=JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'t',version:'1'}}});const r=http.request({host:'localhost',port:3000,path:'/mcp',method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream','Content-Length':Buffer.byteLength(body)}},res=>{console.log('MCP status:',res.statusCode,'session:',res.headers['mcp-session-id']||'none');res.resume();});r.end(body);\"",
+    "start:http": "cross-env TRANSPORT_MODE=sse PORT=3000 node server.js"
   },
   "keywords": [
     "mcp",

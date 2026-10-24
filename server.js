@@ -8,7 +8,8 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import express from 'express';
@@ -24,7 +25,7 @@ class YahooMailMCPServer {
         this.server = new Server(
             {
                 name: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '3.1.0',
             },
             {
                 capabilities: {
@@ -33,8 +34,12 @@ class YahooMailMCPServer {
             }
         );
 
-        // Store active SSE transports (for routing messages)
+        // Store active SSE transports (legacy /mcp/sse transport, kept for rollback)
         this.transports = new Map();
+
+        // Store active Streamable HTTP transports, keyed by MCP session ID.
+        // Each entry owns its own Server instance so two clients cannot cross wires.
+        this.httpTransports = new Map();
 
         // OAuth access tokens are stateless: signed with OAUTH_CLIENT_SECRET,
         // so they survive process restarts (Render free-tier spin-down).
@@ -82,9 +87,9 @@ class YahooMailMCPServer {
     /**
      * Setup MCP tool handlers
      */
-    setupToolHandlers() {
+    setupToolHandlers(server = this.server) {
         // Handle tool listing
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -341,7 +346,7 @@ class YahooMailMCPServer {
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             try {
@@ -562,7 +567,8 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
@@ -765,7 +771,8 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                    size: true
                     });
 
                     const emails = [];
@@ -964,7 +971,8 @@ class YahooMailMCPServer {
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
@@ -1254,6 +1262,46 @@ class YahooMailMCPServer {
         });
     }
 
+    /**
+     * Build a fresh MCP Server instance with the full tool set registered.
+     * Streamable HTTP gives every session its own Server + Transport pair, so
+     * concurrent clients cannot be routed into each other's connection.
+     */
+    createServer() {
+        const server = new Server(
+            { name: 'yahoo-mail-mcp', version: '3.1.0' },
+            { capabilities: { tools: {} } }
+        );
+        this.setupToolHandlers(server);
+        server.onerror = (error) => {
+            console.error('[MCP Error]', error);
+        };
+        return server;
+    }
+
+    /**
+     * Periodically drop authorization codes that were never redeemed.
+     * They are single-use and short-lived; without this they accumulate forever.
+     */
+    startAuthCodeSweeper(maxAgeMs = 10 * 60 * 1000, intervalMs = 5 * 60 * 1000) {
+        const timer = setInterval(() => {
+            if (!this.authCodes) return;
+            const cutoff = Date.now() - maxAgeMs;
+            let swept = 0;
+            for (const [code, data] of this.authCodes.entries()) {
+                if (!data || data.created_at < cutoff) {
+                    this.authCodes.delete(code);
+                    swept++;
+                }
+            }
+            if (swept > 0) {
+                console.error(`[OAuth] Swept ${swept} stale authorization code(s); ${this.authCodes.size} remaining`);
+            }
+        }, intervalMs);
+        if (typeof timer.unref === 'function') timer.unref();
+        return timer;
+    }
+
     setupErrorHandling() {
         this.server.onerror = (error) => {
             console.error('[MCP Error]', error);
@@ -1298,9 +1346,9 @@ class YahooMailMCPServer {
         app.use(cors({
             origin: true,  // Allow all origins (Render's proxy may modify origin headers)
             credentials: true,
-            methods: ['GET', 'POST', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-            exposedHeaders: ['Content-Type'],
+            methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'Last-Event-ID'],
+            exposedHeaders: ['Content-Type', 'Mcp-Session-Id'],
             maxAge: 86400  // Cache preflight for 24 hours
         }));
 
@@ -1415,6 +1463,11 @@ class YahooMailMCPServer {
             res.json(getOAuthMetadata(req));
         });
 
+        app.get('/.well-known/oauth-authorization-server/mcp', (req, res) => {
+            console.error('[OAuth] Authorization server metadata for /mcp requested');
+            res.json(getOAuthMetadata(req));
+        });
+
         app.get('/.well-known/oauth-authorization-server/mcp/sse', (req, res) => {
             console.error('[OAuth] Authorization server metadata for /mcp/sse requested');
             res.json(getOAuthMetadata(req));
@@ -1424,6 +1477,11 @@ class YahooMailMCPServer {
         app.get('/.well-known/oauth-protected-resource', (req, res) => {
             console.error('[OAuth] Protected resource metadata requested');
             res.json(getProtectedResourceMetadata(req));
+        });
+
+        app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
+            console.error('[OAuth] Protected resource metadata for /mcp requested');
+            res.json(getProtectedResourceMetadata(req, '/mcp'));
         });
 
         app.get('/.well-known/oauth-protected-resource/mcp/sse', (req, res) => {
@@ -1610,19 +1668,103 @@ class YahooMailMCPServer {
             res.json({
                 status: 'ok',
                 service: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '3.1.0',
                 timestamp: new Date().toISOString(),
                 environment: {
                     nodeVersion: process.version,
                     platform: process.platform,
                     emailConfigured: !!process.env.YAHOO_EMAIL,
                     passwordConfigured: !!process.env.YAHOO_APP_PASSWORD,
-                    transportMode: process.env.TRANSPORT_MODE || 'stdio'
+                    transportMode: process.env.TRANSPORT_MODE || 'stdio',
+                    // Surfaced so a health check can prove auth is switched on
+                    // without exposing the credentials themselves.
+                    oauthConfigured: !!(process.env.OAUTH_CLIENT_ID && process.env.OAUTH_CLIENT_SECRET)
+                },
+                sessions: {
+                    streamableHttp: this.httpTransports.size,
+                    legacySse: this.transports.size
                 }
             });
         });
 
-        // SSE endpoint for MCP
+        // ---------------------------------------------------------------
+        // Streamable HTTP endpoint (current MCP transport).
+        // One URL handles everything: POST to send, GET to open the stream,
+        // DELETE to end the session.
+        // ---------------------------------------------------------------
+        const handleStreamableRequest = async (req, res) => {
+            const sessionId = req.headers['mcp-session-id'];
+
+            try {
+                // Existing session: route strictly by its own session ID.
+                if (sessionId) {
+                    const existing = this.httpTransports.get(sessionId);
+                    if (!existing) {
+                        console.error('[HTTP] Unknown session ID:', sessionId);
+                        return res.status(404).json({
+                            jsonrpc: '2.0',
+                            error: { code: -32001, message: 'Session not found' },
+                            id: null
+                        });
+                    }
+                    console.error(`[HTTP] ${req.method} on session ${sessionId}`);
+                    return await existing.transport.handleRequest(req, res, req.body);
+                }
+
+                // No session ID: only a fresh initialize may open one.
+                if (req.method !== 'POST' || !isInitializeRequest(req.body)) {
+                    console.error('[HTTP] Request without a session ID and not an initialize');
+                    return res.status(400).json({
+                        jsonrpc: '2.0',
+                        error: { code: -32000, message: 'Bad Request: no valid session ID provided' },
+                        id: null
+                    });
+                }
+
+                console.error('[HTTP] New session initializing from:', req.ip);
+
+                const server = this.createServer();
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => crypto.randomUUID(),
+                    onsessioninitialized: (sid) => {
+                        this.httpTransports.set(sid, { transport, server });
+                        console.error(`[HTTP] Session established: ${sid} (active: ${this.httpTransports.size})`);
+                    },
+                    onsessionclosed: (sid) => {
+                        this.httpTransports.delete(sid);
+                        console.error(`[HTTP] Session closed by client: ${sid} (active: ${this.httpTransports.size})`);
+                    }
+                });
+
+                transport.onclose = () => {
+                    if (transport.sessionId && this.httpTransports.delete(transport.sessionId)) {
+                        console.error(`[HTTP] Transport closed, cleaned up session: ${transport.sessionId} (active: ${this.httpTransports.size})`);
+                    }
+                };
+
+                await server.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+            } catch (error) {
+                console.error('[HTTP] Error handling request:', error);
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        jsonrpc: '2.0',
+                        error: { code: -32603, message: 'Internal server error' },
+                        id: null
+                    });
+                }
+            }
+        };
+
+        app.post('/mcp', handleStreamableRequest);
+        app.get('/mcp', handleStreamableRequest);
+        app.delete('/mcp', handleStreamableRequest);
+
+        // ---------------------------------------------------------------
+        // Legacy SSE endpoints. Deprecated by the MCP spec and kept only so
+        // the existing connector URL keeps working through the changeover.
+        // Safe to delete once the connector points at /mcp.
+        // ---------------------------------------------------------------
         app.get('/mcp/sse', async (req, res) => {
             try {
                 console.error('[SSE] New connection established from:', req.ip);
@@ -1669,16 +1811,11 @@ class YahooMailMCPServer {
                 // Let the transport handle the message
                 transport.handlePostMessage(req, res);
             } else {
-                // If no session ID or transport not found, try the first available transport
-                // (for backwards compatibility with single-connection scenario)
-                const firstTransport = Array.from(this.transports.values())[0];
-                if (firstTransport) {
-                    console.error('[SSE] No session ID, using first available transport');
-                    firstTransport.handlePostMessage(req, res);
-                } else {
-                    console.error('[SSE] No active transport found');
-                    res.status(404).json({ error: 'No active SSE connection found' });
-                }
+                // No fallback to "the first transport in the map": with two
+                // clients connected that routes one client's messages into the
+                // other's session. Fail loudly instead.
+                console.error('[SSE] No transport matches session ID:', sessionId);
+                res.status(404).json({ error: 'No active SSE connection found for this session' });
             }
         });
 
@@ -1695,12 +1832,13 @@ class YahooMailMCPServer {
         app.get('/', (req, res) => {
             res.json({
                 name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
+                version: '3.1.0',
                 description: 'MCP server for Yahoo Mail access via IMAP',
                 endpoints: {
                     health: '/health',
-                    sse: '/mcp/sse',
-                    message: '/mcp/message'
+                    mcp: '/mcp',
+                    sse: '/mcp/sse (deprecated)',
+                    message: '/mcp/message (deprecated)'
                 },
                 tools: [
                     'list_emails',
@@ -1717,9 +1855,12 @@ class YahooMailMCPServer {
             });
         });
 
+        this.startAuthCodeSweeper();
+
         app.listen(port, () => {
             console.error(`Yahoo Mail MCP server running on port ${port}`);
-            console.error(`SSE endpoint: http://localhost:${port}/mcp/sse`);
+            console.error(`MCP endpoint (streamable HTTP): http://localhost:${port}/mcp`);
+            console.error(`MCP endpoint (legacy SSE):      http://localhost:${port}/mcp/sse`);
             console.error(`Health check: http://localhost:${port}/health`);
         });
     }
