@@ -778,7 +778,7 @@ read_email({ uids: [510867], folder: "Sent" })
 Advanced search with filters for date ranges, sender, and unread status.
 
 **Parameters:**
-- `query` (optional): Search term for subject or sender (can be empty for date-only searches)
+- `query` (optional): Search term. The server asks Yahoo for subject OR sender, but **Yahoo also returns message body matches** (verified 2026-11-10 against a live mailbox). Expect broader results than subject and sender alone. Can be empty for date-only searches.
 - `count` (optional): Number of results to return (default: 10, max: 50)
 - `dateFrom` (optional): Filter emails from this date onwards (ISO 8601 or RFC 2822 format)
 - `dateTo` (optional): Filter emails up to this date (ISO 8601 or RFC 2822 format)
