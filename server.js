@@ -562,7 +562,8 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    size: true   // FIX: without this node-imap never sends RFC822.SIZE, so attrs.size is undefined
                 });
 
                 const emails = [];
@@ -590,7 +591,7 @@ class YahooMailMCPServer {
                             from: parsed.from?.[0] || 'Unknown',
                             subject: parsed.subject?.[0] || 'No Subject',
                             date: parsed.date?.[0] || 'Unknown Date',
-                            size: attrs.size || 0,                   // NEW: Message size in bytes
+                            size: attrs.size ?? null,                // FIX: null means unknown; 0 is a measurement
                             flags: attrs.flags || [],                // NEW: IMAP flags
                             hasAttachments: this.hasAttachments(attrs.struct) // NEW
                         });
@@ -765,7 +766,8 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                        size: true   // FIX: see listEmails - RFC822.SIZE is only requested when size:true
                     });
 
                     const emails = [];
@@ -792,7 +794,7 @@ class YahooMailMCPServer {
                                 from: parsed.from?.[0] || 'Unknown',
                                 subject: parsed.subject?.[0] || 'No Subject',
                                 date: parsed.date?.[0] || 'Unknown Date',
-                                size: attrs.size || 0,
+                                size: attrs.size ?? null,   // FIX: null means unknown; 0 is a measurement
                                 flags: attrs.flags || [],
                                 hasAttachments: this.hasAttachments(attrs.struct)
                             });
@@ -964,11 +966,14 @@ class YahooMailMCPServer {
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true   // FIX: see listEmails - RFC822.SIZE is only requested when size:true
                 });
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parsePromises = [];   // FIX: see msg 'end' handler below
+                const parseErrors = [];
 
                 fetch.on('message', (msg, seqno) => {
                     let buffer = '';
@@ -986,12 +991,11 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
+                        // FIX: simpleParser is ASYNCHRONOUS. Previously its callback pushed into
+                        // `emails` AFTER fetch's 'end' handler had already resolved the promise,
+                        // so read_email resolved with an empty string and no error. Collect the
+                        // promise here and await it in 'end' before building the output.
+                        parsePromises.push(simpleParser(buffer).then((parsed) => {
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,  // Still include for reference
@@ -999,12 +1003,19 @@ class YahooMailMCPServer {
                                 to: parsed.to?.text || 'Unknown',
                                 subject: parsed.subject || 'No Subject',
                                 date: parsed.date || 'Unknown Date',
-                                size: attrs.size || 0,
+                                size: attrs.size ?? null,   // FIX: null means unknown; 0 is a measurement
                                 flags: attrs.flags || [],
                                 hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
+                                content: parsed.text || parsed.html || 'No content available',
+                                attachments: (parsed.attachments || []).map(a => ({
+                                    filename: a.filename || '(unnamed)',
+                                    contentType: a.contentType,
+                                    size: a.size
+                                }))
                             });
-                        });
+                        }).catch((err) => {
+                            parseErrors.push({ uid: attrs?.uid, message: err.message });
+                        }));
                     });
                 });
 
@@ -1013,8 +1024,20 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+
+                    // FIX: wait for every simpleParser call to finish before reading `emails`.
+                    await Promise.all(parsePromises);
+
+                    // FIX: a parse failure must surface, not silently shorten the output.
+                    if (parseErrors.length > 0) {
+                        reject(new Error(
+                            `Failed to parse ${parseErrors.length} of ${uids.length} message(s): ` +
+                            parseErrors.map(e => `uid ${e.uid}: ${e.message}`).join('; ')
+                        ));
+                        return;
+                    }
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
@@ -1043,6 +1066,16 @@ class YahooMailMCPServer {
                         `--- Content ---\n` +
                         `${email.content}`
                     ).join('\n\n' + '='.repeat(80) + '\n\n');
+
+                    // FIX: last line of defence - an empty body is never a valid success here.
+                    if (emailContent.length === 0) {
+                        reject(new Error(
+                            `read_email produced no output for UID(s) ${uids.join(', ')} despite ` +
+                            `fetching ${foundUIDs.size} message(s). This should not happen; ` +
+                            `report it rather than treating it as an empty mailbox.`
+                        ));
+                        return;
+                    }
 
                     resolve({
                         content: [{
