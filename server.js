@@ -961,7 +961,13 @@ class YahooMailMCPServer {
                     return;
                 }
 
-                const source = uids.join(',');
+                // FIX: pass the ARRAY, never a pre-joined string. node-imap wraps a non-array
+                // argument as [str], and validateUIDList then runs parseInt("489937,489938")
+                // which returns 489937 and SILENTLY DISCARDS every UID after the first comma.
+                // Nothing errors: the batch quietly fetches one message and the missing-UID
+                // guard then reports the rest as "deleted or moved". node-imap joins the
+                // array itself (Connection.js:794), producing the correct UID FETCH set.
+                const source = uids;
 
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
