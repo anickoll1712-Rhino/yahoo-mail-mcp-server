@@ -89,7 +89,7 @@ class YahooMailMCPServer {
                 tools: [
                     {
                         name: 'list_emails',
-                        description: 'List recent emails from a Yahoo Mail folder. Returns UIDs (permanent identifiers) and enriched metadata including size, flags, and attachment status.',
+                        description: 'List recent emails from a Yahoo Mail folder. Returns UIDs and enriched metadata including size, flags, and attachment status. size is null when the server did not report one - null means unknown, never zero. A UID is permanent only WITHIN a folder - moving, archiving or trashing a message assigns it a NEW UID, so a stored UID stops resolving after any move (verified 2026-11-10).',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -113,14 +113,14 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'read_email',
-                        description: 'Read email content using UIDs (permanent identifiers). UIDs don\'t change when emails are deleted. Get UIDs from list_emails or search_emails.',
+                        description: 'Read email content and attachment metadata using UIDs. Get UIDs from list_emails or search_emails. A UID is permanent only WITHIN a folder - moving, archiving or trashing a message assigns it a NEW UID, so a stored UID stops resolving after any move (verified 2026-11-10).',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 uids: {
                                     type: 'array',
                                     items: { type: 'number' },
-                                    description: 'Array of UIDs to read. UIDs are permanent identifiers from list_emails.',
+                                    description: 'Array of UIDs to read, from list_emails or search_emails. Re-read them after any move - see the tool description.',
                                     minItems: 1
                                 },
                                 folder: {
@@ -134,13 +134,13 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'search_emails',
-                        description: 'Search emails using UIDs with advanced filters. Returns UIDs which are permanent identifiers that don\'t change when emails are deleted. Get UIDs from results for subsequent operations.',
+                        description: 'Search emails using UIDs with advanced filters. Returns UIDs. NOTE: on Yahoo, a text query also matches the MESSAGE BODY, not only the subject and sender this server asks for - see the query field. CAUTION: a UID is permanent only WITHIN a folder; moving, archiving or trashing a message gives it a NEW UID, so a stored UID stops resolving after any move.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 query: {
                                     type: 'string',
-                                    description: 'Search term for subject or sender (can be empty for date-only searches)',
+                                    description: 'Search term. This server asks Yahoo for subject OR sender only, but YAHOO ALSO RETURNS MESSAGE BODY MATCHES - verified 2026-11-10 against a live mailbox, where a body-only phrase returned its message. Expect broader results than subject and sender alone. Can be empty for date-only searches.',
                                     default: ''
                                 },
                                 count: {
@@ -179,7 +179,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'delete_emails',
-                        description: 'Move emails to Trash folder using UIDs (soft delete, recoverable). UIDs are permanent identifiers.',
+                        description: 'SOFT DELETE - moves emails to the Trash folder. Nothing is expunged and the message stays recoverable from Trash. A UID is permanent only WITHIN a folder - moving, archiving or trashing a message assigns it a NEW UID, so a stored UID stops resolving after any move (verified 2026-11-10).',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -200,7 +200,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'archive_emails',
-                        description: 'Move emails to Archive folder using UIDs for long-term storage. UIDs are permanent identifiers.',
+                        description: 'Move emails to the Archive folder for long-term storage. A UID is permanent only WITHIN a folder - moving, archiving or trashing a message assigns it a NEW UID, so a stored UID stops resolving after any move (verified 2026-11-10).',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -221,7 +221,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'mark_as_read',
-                        description: 'Mark emails as read using UIDs. UIDs are permanent identifiers.',
+                        description: 'Mark emails as read. Does not move the message, so UIDs are unaffected.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -242,7 +242,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'mark_as_unread',
-                        description: 'Mark emails as unread using UIDs. UIDs are permanent identifiers.',
+                        description: 'Mark emails as unread. Does not move the message, so UIDs are unaffected.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -263,7 +263,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'flag_emails',
-                        description: 'Flag emails as important/starred using UIDs. UIDs are permanent identifiers.',
+                        description: 'Flag emails as important/starred. Does not move the message, so UIDs are unaffected.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -284,7 +284,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'unflag_emails',
-                        description: 'Remove flag/star from emails using UIDs. UIDs are permanent identifiers.',
+                        description: 'Remove flag/star from emails. Does not move the message, so UIDs are unaffected.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -305,7 +305,7 @@ class YahooMailMCPServer {
                     },
                     {
                         name: 'move_emails',
-                        description: 'Move emails to a specified folder using UIDs. UIDs are permanent identifiers. Use list_folders to see available folders.',
+                        description: 'Move emails to a specified folder. Use list_folders to see available folders. A UID is permanent only WITHIN a folder - moving, archiving or trashing a message assigns it a NEW UID, so a stored UID stops resolving after any move (verified 2026-11-10).',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -685,6 +685,13 @@ class YahooMailMCPServer {
                 const criteria = [];
 
                 // Text search (subject or from)
+                // MEASURED 2026-11-10, NOT ASSUMED: this criteria set is correct and asks only for
+                // SUBJECT or FROM, but Yahoo's IMAP server returns MESSAGE BODY matches as well.
+                // Verified against the live mailbox - a phrase present only in a message body
+                // returned that message. The widening is Yahoo's, not this code's, so it is
+                // DOCUMENTED in the tool description rather than "fixed" here: narrowing it would
+                // mean filtering results after the fact and silently discarding matches a user may
+                // well have wanted. Do not "correct" this block to match the old description.
                 if (query && query.trim().length > 0) {
                     criteria.push([
                         'OR',
